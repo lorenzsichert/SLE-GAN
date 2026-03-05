@@ -97,14 +97,12 @@ class Generator(nn.Module):
         for i in self.nfc:
             if i < layer:
                 self.features.append(UpBlock(self.nfc[i], self.nfc[i*2]))
-            else:
-                break
 
-        self.to_big_low = nn.Sequential(
-            spectral_norm(nn.Conv2d(self.nfc[layer // 2], self.nc, 3, 1, 1, bias=False))
-        )
-        self.to_big_high = nn.Sequential(
+        self.to_big = nn.Sequential(
             spectral_norm(nn.Conv2d(self.nfc[layer], self.nc, 3, 1, 1, bias=False))
+        )
+        self.to_128 = nn.Sequential(
+            spectral_norm(nn.Conv2d(self.nfc[128], self.nc, 3, 1, 1, bias=False))
         )
 
         self.sle = nn.ModuleList()
@@ -113,21 +111,13 @@ class Generator(nn.Module):
         for i in self.nfc:
             if i >= 64 and i <= layer:
                 self.sle.append(SLE(self.nfc[i // 16], self.nfc[i]))
+
         print(self.features)
         print(self.sle)
 
 
-    def add_layer(self):
-        self.features.append(UpBlock(self.nfc[self.layer], self.nfc[self.layer*2]))
-        self.to_big_low = self.to_big_high
-        self.layer *= 2
-        self.to_big_high = nn.Sequential(
-            spectral_norm(nn.Conv2d(self.nfc[self.layer], self.nc, 3, 1, 1, bias=False))
-        )
 
-
-
-    def forward(self, input, alpha=1.0):
+    def forward(self, input):
         feature = self.init(input)
         features = [feature]
         f = 0
@@ -140,15 +130,23 @@ class Generator(nn.Module):
                 f += 1
 
 
-        big_low = interpolate(self.to_big_low(feature), (self.layer,self.layer))
         feature = self.features[len(self.features)-1](feature)
         if self.layer == 128:
             feature = self.sle[1](features[1],feature)
         if self.layer == 256:
             feature = self.sle[2](features[2],feature)
-        big_high = self.to_big_high(feature)
+        if self.layer == 512:
+            feature = self.sle[3](features[3],feature)
+        if self.layer == 1024:
+            feature = self.sle[4](features[4],feature)
 
-        return (1-alpha) * big_low + alpha * big_high
+        big = self.to_big(feature)
+        big_128 = self.to_128(features[5])
+
+        if self.training:
+            return big, big_128
+        else:
+            return big
 
 
 
@@ -202,43 +200,87 @@ class Discriminator(nn.Module):
         for k, v in nfc_multi.items():
             self.nfc[k] = int(v*ndf)
 
-        self.rf = nn.Sequential(spectral_norm(nn.Conv2d(self.nfc[4], 1, 2, 1, 0)))
         self.features = nn.ModuleList()
 
+        min_channel = 16
+
         for i in self.nfc:
-            if i < layer:
+
+            if i >= min_channel and i < layer:
                 self.features.append(downBlock(self.nfc[i*2], self.nfc[i]))
-            else:
-                break
 
 
-        self.down_from_big_high = downBlockHead(3, self.nfc[self.layer])
+        self.down_from_big = downBlockHead(3, self.nfc[self.layer])
+        self.down_from_small = nn.Sequential(
+            spectral_norm(nn.Conv2d(nc, self.nfc[256], 4, 2, 1, bias=False)),
+            nn.LeakyReLU(0.2),
+            downBlock(self.nfc[256], self.nfc[128]),
+            downBlock(self.nfc[128], self.nfc[64]),
+            downBlock(self.nfc[64], self.nfc[32]),
+        )
 
-        self.down_from_big_low = downBlockHead(3, self.nfc[self.layer // 2])
+        self.rf = nn.Sequential(
+            spectral_norm(nn.Conv2d(self.nfc[16], self.nfc[8], 1, 1, 0, bias=False)),
+            nn.BatchNorm2d(self.nfc[8]), nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Conv2d(self.nfc[8], 1, 4, 1, 0, bias=False)),
+        )
 
-
-    def add_layer(self):
-        self.features.append(downBlock(self.nfc[self.layer * 2], self.nfc[self.layer]))
-
-
-        self.down_from_big_low = self.down_from_big_high
-        self.down_from_big_high = downBlockHead(3, self.nfc[self.layer * 2])
-        self.layer *= 2
-
-
-
-    def forward(self, input, alpha):
-        feature_high = self.down_from_big_high(input)
-        feature_high_low = self.features[len(self.features)-1](feature_high)
-
-        input_low = interpolate(input, (self.layer // 2, self.layer // 2))
-        feature_low = self.down_from_big_low(input_low)
+        self.rf_small = nn.Sequential(spectral_norm(nn.Conv2d(self.nfc[32], 1, 4, 1, 0, bias=False)))
 
 
-        feature = (1-alpha) * feature_low + alpha * feature_high_low
+        self.decoder_small = SimpleDecoder(self.nfc[32], nc)
+        self.decoder_big = SimpleDecoder(self.nfc[16], nc)
 
-        for i in reversed(range(len(self.features)-1)):
+
+
+    def forward(self, input, input_128, label="fake", part=(0,0)):
+        # Main Big Image
+        feature = self.down_from_big(input)
+        features = [feature]
+
+        for i in reversed(range(len(self.features))):
             feature = self.features[i](feature)
+            features.append(feature)
 
-        return self.rf(feature)
+        # 128 Small Image
+        feature_small = self.down_from_small(input_128)
+        rf = self.rf(feature).view(-1)
+        rf_small = self.rf_small(feature_small).view(-1)
 
+        if label == "real":
+            rec_big = self.decoder_big(features[len(features)-1])
+            rec_small = self.decoder_small(features[len(features)-2])
+            rec_part = self.decoder_small(features[len(features)-2][:,:,part[0]:(part[0]+8),part[1]:(part[1]+8)])
+            return torch.cat([rf, rf_small]), [rec_small, rec_big, rec_part]
+             
+
+        return torch.cat([rf, rf_small])
+
+class SimpleDecoder(nn.Module):
+    """docstring for CAN_SimpleDecoder"""
+    def __init__(self, nfc_in=64, nc=3):
+        super(SimpleDecoder, self).__init__()
+
+        nfc_multi = {4:16, 8:8, 16:4, 32:2, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
+        nfc = {}
+        for k, v in nfc_multi.items():
+            nfc[k] = int(v*16)
+
+        def upBlock(in_planes, out_planes):
+            block = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                spectral_norm(nn.Conv2d(in_planes, out_planes*2, 3, 1, 1, bias=False)),
+                nn.BatchNorm2d(out_planes*2), GLU())
+            return block
+
+        self.main = nn.Sequential(  nn.AdaptiveAvgPool2d(8),
+                                    upBlock(nfc_in, nfc[16]) ,
+                                    upBlock(nfc[16], nfc[32]),
+                                    upBlock(nfc[32], nfc[64]),
+                                    upBlock(nfc[64], nfc[128]),
+                                    spectral_norm(nn.Conv2d(nfc[128], nc, 3, 1, 1, bias=False)),
+                                    nn.Tanh() )
+
+    def forward(self, input):
+        # input shape: c x 4 x 4
+        return self.main(input)
