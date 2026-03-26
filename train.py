@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import torchvision
 from torchvision.utils import save_image
+from torch.nn.functional import interpolate
 import copy
 
 import lpips
@@ -14,7 +15,7 @@ import lpips
 
 from diffaug import DiffAugment
 
-from models import Generator, interpolate
+from models import Generator
 from models import Discriminator
 
 
@@ -22,30 +23,33 @@ from models import Discriminator
 torch.set_num_threads(20)
 torch.set_num_interop_threads(20)
 
-n_epochs = 2000
 b1 = 0.5
 b2 = 0.99
 lr_g = 0.0002
 lr_d = 0.0002
+ema_alpha = 0.999
+
 latent_dim = 256
 features = 16
-img_size = 512
-layer = 512
+img_size = 256
+layer = 256
 channels = 3
-batch_size = 2
+
+num_classes = 10
+
+batch_size = 1
 discriminator_batch_size = batch_size
-sample_interval = 64
+sample_interval = 16
+ckpt_interval = 1024
 
-alpha_end = 200.0
-alpha_incease = 0.0002
-alpha_dropdown = 1.0
-counting_alpha = 1.0
 
-load_ckpt = True
+n_epochs = 2000
+start_ep = 0
+load_ckpt = False
 
 
 # --- Dataset Loading ---
-link = "../progressive-gan/iamkaikaisubset/"
+link = "../progressive-gan/album_covers_sorted/"
 split = "train"
 image_tag = "image"
 
@@ -96,13 +100,13 @@ else:
 
 
 
-generator = Generator(nz=latent_dim, ngf=features, img_size=img_size, nc=channels, layer=layer)
-discriminator = Discriminator(ndf=features, nc=channels, img_size=img_size, layer=layer)
+generator = Generator(nz=latent_dim, ngf=features, img_size=img_size, nc=channels, layer=layer, num_classes=num_classes)
+discriminator = Discriminator(ndf=features, nc=channels, img_size=img_size, layer=layer, num_classes=num_classes)
 
 if load_ckpt:
     try:
-        generator.load_state_dict(torch.load(f"ckpt/G-{layer}.pth"))
-        discriminator.load_state_dict(torch.load(f"ckpt/D-{layer}.pth"))
+        generator.load_state_dict(torch.load(f"ckpt2/G-{layer}.pth"))
+        discriminator.load_state_dict(torch.load(f"ckpt2/D-{layer}.pth"))
         print("Models loaded from file!")
     except:
         print("Models could not be loaded!")
@@ -127,36 +131,24 @@ fixed_noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
 iteration = 0
 
 
-for ep in range(n_epochs):
+for ep in range(start_ep, n_epochs):
     print(f"Epoch {ep}:")
+    print(dataset.classes)
 
 
     i = 0
-    for batch in dataloader:
+    for batch, labels in dataloader:
         iteration += 1
-
-        counting_alpha += alpha_incease
-        if (counting_alpha >= alpha_end and layer < img_size):
-            counting_alpha = 0.0
-            alpha_incease *= alpha_dropdown
-            torch.save(generator.state_dict(), f"G-{layer}.pth")
-            torch.save(discriminator.state_dict(), f"D-{layer}.pth")
-            print("layer")
-            layer *= 2
-
-            generator.to(device)
-            discriminator.to(device)
-
-            optimizerG = optim.Adam(generator.parameters(), lr=lr_g, betas=(b1, b2))
-            optimizerD = optim.Adam(discriminator.parameters(), lr=lr_d, betas=(b1, b2))
-        alpha = min(max(0.0,counting_alpha),1.0)
         i += 1
 
 
         # Train Discriminator on Real Images
         discriminator.zero_grad()
 
-        real = batch[0].to(device)
+        for i in labels:
+            print(i)
+            print(dataset.classes[i])
+        real = batch.to(device)
         real = interpolate(real, (layer, layer))
         real_128 = interpolate(real, size=128)
         real = DiffAugment(real, policy="color,translation")
@@ -205,7 +197,6 @@ for ep in range(n_epochs):
 
         with torch.no_grad():
             for p_ema, p in zip(generator_ema.parameters(), generator.parameters()):
-                ema_alpha = 0.999
                 p_ema.data.mul_(ema_alpha).add_(p.data, alpha=1 - ema_alpha)
             for b_ema, b in zip(generator_ema.buffers(), generator.buffers()):
                 b_ema.data.copy_(b.data)
@@ -218,14 +209,14 @@ for ep in range(n_epochs):
         if iteration % sample_interval == 0:
             save_image(output, f"images/image-{ep}.png", normalize=True)
             save_image(output_128, f"images/image-128-{ep}.png", normalize=True)
-            out = torch.cat([rec_part, rec_big, rec_small])
-            save_image(out, f"images/image-rec--{ep}.png", normalize=True)
+            out = torch.cat([real_128, rec_part, rec_big, rec_small])
+            save_image(out, f"images/image-rec-{ep}.png", nrow=batch_size, normalize=True)
             with torch.no_grad():
                 fixed, fixed_128 = generator_ema(fixed_noise)
                 save_image(fixed, f"images/image-f-{ep}.png", normalize=True)
                 save_image(fixed_128, f"images/image-128-f-{ep}.png", normalize=True)
-        if iteration % sample_interval == 0:
+        if iteration % ckpt_interval == 0:
             print("save dict")
-            torch.save(generator.state_dict(), f"ckpt2/G-{layer}.pth")
-            torch.save(generator_ema.state_dict(), f"ckpt2/GE-{layer}.pth")
-            torch.save(discriminator.state_dict(), f"ckpt2/D-{layer}.pth")
+            torch.save(generator.state_dict(), f"ckpt/G-{layer}-Epoch-{ep}.pth")
+            torch.save(generator_ema.state_dict(), f"ckpt/GE-{layer}-Epoch-{ep}.pth")
+            torch.save(discriminator.state_dict(), f"ckpt/D-{layer}-Epoch-{ep}.pth")

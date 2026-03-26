@@ -1,6 +1,5 @@
 import torch.nn as nn
 import torch
-from torch.nn.functional import interpolate
 from torch.nn.utils import spectral_norm
 
 
@@ -80,12 +79,13 @@ class SLE(nn.Module):
         return high_feat * excitation
 
 class Generator(nn.Module):
-    def __init__(self, nz, ngf, nc, img_size, layer):
+    def __init__(self, nz, ngf, nc, img_size, layer, num_classes):
         super().__init__()
 
         self.img_size = img_size
         self.layer = layer
         self.nc = nc
+        self.num_classes = num_classes
 
         nfc_multi = {4:32, 8:16, 16:8, 32:4, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
         self.nfc = {}
@@ -111,6 +111,8 @@ class Generator(nn.Module):
         for i in self.nfc:
             if i >= 64 and i <= layer:
                 self.sle.append(SLE(self.nfc[i // 16], self.nfc[i]))
+
+        self.emebdding = nn.Embedding(self.num_classes, nz)
 
         print(self.features)
         print(self.sle)
@@ -229,6 +231,7 @@ class Discriminator(nn.Module):
 
 
         self.decoder_small = SimpleDecoder(self.nfc[32], nc)
+        self.decoder_part = SimpleDecoder(self.nfc[32], nc)
         self.decoder_big = SimpleDecoder(self.nfc[16], nc)
 
 
@@ -250,7 +253,7 @@ class Discriminator(nn.Module):
         if label == "real":
             rec_big = self.decoder_big(features[len(features)-1])
             rec_small = self.decoder_small(features[len(features)-2])
-            rec_part = self.decoder_small(features[len(features)-2][:,:,part[0]:(part[0]+8),part[1]:(part[1]+8)])
+            rec_part = self.decoder_part(features[len(features)-2][:,:,part[0]:(part[0]+8),part[1]:(part[1]+8)])
             return torch.cat([rf, rf_small]), [rec_small, rec_big, rec_part]
              
 
@@ -264,7 +267,7 @@ class SimpleDecoder(nn.Module):
         nfc_multi = {4:16, 8:8, 16:4, 32:2, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
         nfc = {}
         for k, v in nfc_multi.items():
-            nfc[k] = int(v*16)
+            nfc[k] = int(v*32)
 
         def upBlock(in_planes, out_planes):
             block = nn.Sequential(
