@@ -119,7 +119,7 @@ class Generator(nn.Module):
         self.splits = int(math.log(self.img_size, 2) - 1)
         self.chunk_size = nz // self.splits
 
-        nfc_multi = {4:32, 8:16, 16:8, 32:4, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
+        nfc_multi = {4:16, 8:8, 16:4, 32:2, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
         self.nfc = {}
         for k, v in nfc_multi.items():
             self.nfc[k] = int(v*ngf)
@@ -226,7 +226,7 @@ class Discriminator(nn.Module):
         self.nc = nc
         self.skip_layer = skip_layer
 
-        nfc_multi = {4:32, 8:16, 16:8, 32:4, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
+        nfc_multi = {4:16, 8:16, 16:8, 32:4, 64:2, 128:1, 256:0.5, 512:0.25, 1024:0.125}
         self.nfc = {}
         for k, v in nfc_multi.items():
             self.nfc[k] = int(v*ndf)

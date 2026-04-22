@@ -1,7 +1,7 @@
 import os
 from PIL import Image
 import numpy
-from torch import mean, optim, randint
+from torch import mean, optim, randint, abs
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, dataset
@@ -30,10 +30,10 @@ b1 = 0.5
 b2 = 0.99
 lr_g = 0.0002
 lr_d = 0.0002
-ema_alpha = 0.999
+ema_alpha = 0.99
 
 latent_dim = 256
-features = 32
+features = 16
 img_size = 512
 channels = 3
 
@@ -183,7 +183,7 @@ for ep in range(start_ep, n_epochs):
 
         # Train Discriminator on Fake Images
         noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
-        y = torch.randn(batch_size,num_classes,1,1)
+        y = labels.to(device).view(batch_size, num_classes, 1, 1)
         fake, fake_128 = generator(noise, y)
         fake = DiffAugment(fake, policy="color,translation")
         fake_128 = DiffAugment(fake_128, policy="color,translation")
@@ -198,12 +198,20 @@ for ep in range(start_ep, n_epochs):
         # Train Generator with Discriminator
         generator.zero_grad()
         noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
-        y = torch.randn(batch_size, num_classes, 1, 1)
+        y = labels.to(device).view(batch_size, num_classes, 1, 1)
         output, output_128 = generator(noise, y)
         output = DiffAugment(output, policy="color,translation")
         output_128 = DiffAugment(output_128, policy="color,translation")
         output_fake = discriminator(output, output_128, y) 
         loss_generated = -mean(output_fake)
+
+        # Brightness conditioning loss
+        generated_brightness = output.mean(dim=[1, 2, 3])
+        target_brightness = y.view(batch_size, num_classes).squeeze(-1).squeeze(-1)
+        loss_brightness = nn.functional.mse_loss(generated_brightness, target_brightness)
+        loss_brightness_128 = nn.functional.mse_loss(output_128.mean(dim=[1, 2, 3]), target_brightness)
+        loss_generated = loss_generated + loss_brightness + loss_brightness_128
+
         loss_generated.backward()
         optimizerG.step()
 
