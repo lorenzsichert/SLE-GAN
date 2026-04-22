@@ -1,13 +1,16 @@
+import os
+from PIL import Image
+import numpy
 from torch import mean, optim, randint
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, dataset
 from torch.utils.data import DataLoader
 from torchvision import transforms
-import torchvision
-from torchvision.utils import save_image
+from torchvision.utils import make_grid, save_image
 from torch.nn.functional import interpolate
 import copy
+import pandas
 
 import lpips
 
@@ -30,43 +33,49 @@ lr_d = 0.0002
 ema_alpha = 0.999
 
 latent_dim = 256
-features = 16
-img_size = 256
-layer = 256
+features = 32
+img_size = 512
 channels = 3
 
-num_classes = 10
+skip_layer_d = 3
+skip_layer_g = 3
 
-batch_size = 1
+num_classes = 1
+
+batch_size = 8
 discriminator_batch_size = batch_size
 sample_interval = 16
-ckpt_interval = 1024
+ckpt_interval = 256
 
 
-n_epochs = 2000
-start_ep = 0
-load_ckpt = False
+n_epochs = 20000000
+start_ep = 16
+load_ckpt = True
 
 
 # --- Dataset Loading ---
-link = "../progressive-gan/album_covers_sorted/"
+link = "../datasets/"
 split = "train"
 image_tag = "image"
 
 
 class DatasetTransform(Dataset):
-    def __init__(self, dataset, transform):
-        self.dataset = dataset
+    def __init__(self, transform, csv_file, img_dir):
         self.transform = transform
+        self.df = pandas.read_csv(csv_file)
+        self.img_dir = img_dir
 
     def __len__(self):
-        return self.dataset.num_rows
+        return len(self.df)
 
     def __getitem__(self, index):
-        item = self.dataset[index][image_tag]
+        row = self.df.iloc[index]
+        img = Image.open(os.path.join(self.img_dir,row["filename"])).convert("RGB")
+        label = self.df.iloc[index,1:].to_numpy(dtype=numpy.float32)
+        label = torch.tensor(label, dtype=torch.float32)
         if self.transform:
-            item = self.transform(item)
-        return item
+            img = self.transform(img)
+        return img, label
 
 def convert_to_rgb(x):
     return x.convert("RGB")
@@ -78,7 +87,7 @@ transform = transforms.Compose([
     transforms.Normalize([0.5],[0.5])
 ])
 
-dataset = torchvision.datasets.ImageFolder(link, transform=transform)
+dataset = DatasetTransform(transform, "../datasets/Album Covers Small/sorted_images.csv", link)
 dataloader = DataLoader(
     dataset,
     batch_size=discriminator_batch_size,
@@ -100,13 +109,13 @@ else:
 
 
 
-generator = Generator(nz=latent_dim, ngf=features, img_size=img_size, nc=channels, layer=layer, num_classes=num_classes)
-discriminator = Discriminator(ndf=features, nc=channels, img_size=img_size, layer=layer, num_classes=num_classes)
+generator = Generator(nz=latent_dim, ngf=features, img_size=img_size, nc=channels, num_classes=num_classes, skip_layer=skip_layer_g)
+discriminator = Discriminator(ndf=features, nc=channels, img_size=img_size, num_classes=num_classes, skip_layer=skip_layer_d)
 
 if load_ckpt:
     try:
-        generator.load_state_dict(torch.load(f"ckpt2/G-{layer}.pth"))
-        discriminator.load_state_dict(torch.load(f"ckpt2/D-{layer}.pth"))
+        generator.load_state_dict(torch.load(f"ckpt/G-{img_size}-Epoch-{start_ep}.pth"))
+        discriminator.load_state_dict(torch.load(f"ckpt/D-{img_size}-Epoch-{start_ep}.pth"))
         print("Models loaded from file!")
     except:
         print("Models could not be loaded!")
@@ -126,14 +135,18 @@ optimizerD = optim.Adam(discriminator.parameters(), lr=lr_d, betas=(b1, b2))
 
 alpha = 1.0
 
-fixed_noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
+fixed_noise = torch.randn(1, latent_dim, 1, 1).to(device)
+fixed_noise = fixed_noise.repeat(16, 1, 1, 1)
+print(fixed_noise.size())
+
+x = torch.linspace(0, 1, 16)
+grid = x.view(x.size(0), 1, 1, 1)
 
 iteration = 0
 
 
 for ep in range(start_ep, n_epochs):
     print(f"Epoch {ep}:")
-    print(dataset.classes)
 
 
     i = 0
@@ -145,39 +158,37 @@ for ep in range(start_ep, n_epochs):
         # Train Discriminator on Real Images
         discriminator.zero_grad()
 
-        for i in labels:
-            print(i)
-            print(dataset.classes[i])
         real = batch.to(device)
-        real = interpolate(real, (layer, layer))
+        real = interpolate(real, (img_size, img_size))
         real_128 = interpolate(real, size=128)
-        real = DiffAugment(real, policy="color,translation")
         real_128 = DiffAugment(real_128, policy="color,translation")
+        real = DiffAugment(real, policy="color,translation")
+        real_int = interpolate(real, size=128)
 
         part = randint(0,8,(1,2))[0].to(device)
 
-        output_real, [rec_small, rec_big, rec_part] = discriminator(real, real_128, label="real", part=part)
 
-
-
+        #labels = labels.view(batch_size, num_classes, 1, 1)
+        output_real, [rec_small, rec_big, rec_part] = discriminator(real, real_128, class_label=labels, label="real", part=part)
 
         real_part = interpolate(real, size=256)
         real_part = real_part[:,:,part[0]*16:part[0]*16+128,part[1]*16:part[1]*16+128]
 
         loss_real = mean(nn.functional.relu(1 - output_real)) +\
             percept(rec_small, real_128).sum() +\
-            percept(rec_big, real_128).sum() +\
+            percept(rec_big, real_int).sum() +\
             percept(rec_part, real_part).sum()
         loss_real.backward()
-
         
+
         # Train Discriminator on Fake Images
         noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
-        fake, fake_128 = generator(noise)
+        y = torch.randn(batch_size,num_classes,1,1)
+        fake, fake_128 = generator(noise, y)
         fake = DiffAugment(fake, policy="color,translation")
         fake_128 = DiffAugment(fake_128, policy="color,translation")
 
-        output_fake = discriminator(fake, fake_128) 
+        output_fake = discriminator(fake, fake_128, y) 
 
         loss_fake = mean(nn.functional.relu(1 + output_fake))
         loss_fake.backward()
@@ -187,10 +198,11 @@ for ep in range(start_ep, n_epochs):
         # Train Generator with Discriminator
         generator.zero_grad()
         noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
-        output, output_128 = generator(noise)
+        y = torch.randn(batch_size, num_classes, 1, 1)
+        output, output_128 = generator(noise, y)
         output = DiffAugment(output, policy="color,translation")
         output_128 = DiffAugment(output_128, policy="color,translation")
-        output_fake = discriminator(output, output_128) 
+        output_fake = discriminator(output, output_128, y) 
         loss_generated = -mean(output_fake)
         loss_generated.backward()
         optimizerG.step()
@@ -209,14 +221,14 @@ for ep in range(start_ep, n_epochs):
         if iteration % sample_interval == 0:
             save_image(output, f"images/image-{ep}.png", normalize=True)
             save_image(output_128, f"images/image-128-{ep}.png", normalize=True)
-            out = torch.cat([real_128, rec_part, rec_big, rec_small])
+            out = torch.cat([real_128, rec_small, rec_big, rec_part])
             save_image(out, f"images/image-rec-{ep}.png", nrow=batch_size, normalize=True)
             with torch.no_grad():
-                fixed, fixed_128 = generator_ema(fixed_noise)
-                save_image(fixed, f"images/image-f-{ep}.png", normalize=True)
-                save_image(fixed_128, f"images/image-128-f-{ep}.png", normalize=True)
+                fixed, fixed_128 = generator_ema(fixed_noise, grid)
+                save_image(make_grid(fixed, nrow=4), f"images/image-f-{ep}.png", normalize=True)
+                save_image(make_grid(fixed_128, nrow=4), f"images/image-128-f-{ep}.png", normalize=True)
         if iteration % ckpt_interval == 0:
             print("save dict")
-            torch.save(generator.state_dict(), f"ckpt/G-{layer}-Epoch-{ep}.pth")
-            torch.save(generator_ema.state_dict(), f"ckpt/GE-{layer}-Epoch-{ep}.pth")
-            torch.save(discriminator.state_dict(), f"ckpt/D-{layer}-Epoch-{ep}.pth")
+            torch.save(generator.state_dict(), f"ckpt/G-{img_size}-Epoch-{ep}.pth")
+            torch.save(generator_ema.state_dict(), f"ckpt/GE-{img_size}-Epoch-{ep}.pth")
+            torch.save(discriminator.state_dict(), f"ckpt/D-{img_size}-Epoch-{ep}.pth")
