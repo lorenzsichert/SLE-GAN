@@ -30,10 +30,10 @@ b1 = 0.5
 b2 = 0.99
 lr_g = 0.0002
 lr_d = 0.0002
-ema_alpha = 0.99
+ema_alpha = 0.999
 
 latent_dim = 256
-features = 16
+features = 8
 img_size = 512
 channels = 3
 
@@ -49,7 +49,7 @@ ckpt_interval = 256
 
 
 n_epochs = 20000000
-start_ep = 16
+start_ep = 518
 load_ckpt = True
 
 
@@ -87,7 +87,7 @@ transform = transforms.Compose([
     transforms.Normalize([0.5],[0.5])
 ])
 
-dataset = DatasetTransform(transform, "../datasets/Album Covers Small/sorted_images.csv", link)
+dataset = DatasetTransform(transform, "../datasets/Psychart/sorted_images.csv", link)
 dataloader = DataLoader(
     dataset,
     batch_size=discriminator_batch_size,
@@ -159,11 +159,11 @@ for ep in range(start_ep, n_epochs):
         discriminator.zero_grad()
 
         real = batch.to(device)
-        real = interpolate(real, (img_size, img_size))
-        real_128 = interpolate(real, size=128)
+        real = interpolate(real, (img_size, img_size), mode="bilinear")
+        real_128 = interpolate(real, size=128, mode="bilinear")
         real_128 = DiffAugment(real_128, policy="color,translation")
         real = DiffAugment(real, policy="color,translation")
-        real_int = interpolate(real, size=128)
+        real_int = interpolate(real, size=128, mode="bilinear")
 
         part = randint(0,8,(1,2))[0].to(device)
 
@@ -171,27 +171,30 @@ for ep in range(start_ep, n_epochs):
         #labels = labels.view(batch_size, num_classes, 1, 1)
         output_real, [rec_small, rec_big, rec_part] = discriminator(real, real_128, class_label=labels, label="real", part=part)
 
-        real_part = interpolate(real, size=256)
+        real_part = interpolate(real, size=256, mode="bilinear")
         real_part = real_part[:,:,part[0]*16:part[0]*16+128,part[1]*16:part[1]*16+128]
 
         loss_real = mean(nn.functional.relu(1 - output_real)) +\
-            percept(rec_small, real_128).sum() +\
-            percept(rec_big, real_int).sum() +\
-            percept(rec_part, real_part).sum()
-        loss_real.backward()
+            percept(rec_small, real_128.detach()).sum() +\
+            percept(rec_big, real_int.detach()).sum() +\
+            percept(rec_part, real_part.detach()).sum()
         
 
         # Train Discriminator on Fake Images
         noise = torch.randn(batch_size, latent_dim, 1, 1).to(device)
         y = labels.to(device).view(batch_size, num_classes, 1, 1)
         fake, fake_128 = generator(noise, y)
+        fake = fake.detach()
+        fake_128 = fake_128.detach()
         fake = DiffAugment(fake, policy="color,translation")
         fake_128 = DiffAugment(fake_128, policy="color,translation")
 
         output_fake = discriminator(fake, fake_128, y) 
 
         loss_fake = mean(nn.functional.relu(1 + output_fake))
-        loss_fake.backward()
+
+        loss_d = loss_real + loss_fake
+        loss_d.backward()
         optimizerD.step()
  
 
@@ -207,7 +210,9 @@ for ep in range(start_ep, n_epochs):
 
         # Brightness conditioning loss
         generated_brightness = output.mean(dim=[1, 2, 3])
+        generated_brightness = torch.sigmoid(generated_brightness)
         target_brightness = y.view(batch_size, num_classes).squeeze(-1).squeeze(-1)
+        target_brightness = torch.sigmoid(target_brightness)
         loss_brightness = nn.functional.mse_loss(generated_brightness, target_brightness)
         loss_brightness_128 = nn.functional.mse_loss(output_128.mean(dim=[1, 2, 3]), target_brightness)
         loss_generated = loss_generated + loss_brightness + loss_brightness_128
@@ -215,17 +220,18 @@ for ep in range(start_ep, n_epochs):
         loss_generated.backward()
         optimizerG.step()
 
-        with torch.no_grad():
-            for p_ema, p in zip(generator_ema.parameters(), generator.parameters()):
-                p_ema.data.mul_(ema_alpha).add_(p.data, alpha=1 - ema_alpha)
-            for b_ema, b in zip(generator_ema.buffers(), generator.buffers()):
-                b_ema.data.copy_(b.data)
+        if i % 10 == 0:
+            with torch.no_grad():
+                for p_ema, p in zip(generator_ema.parameters(), generator.parameters()):
+                    p_ema.data.mul_(ema_alpha).add_(p.data, alpha=1 - ema_alpha)
+                for b_ema, b in zip(generator_ema.buffers(), generator.buffers()):
+                    b_ema.data.copy_(b.data)
 
 
 
 
         if i % 4 == 0:
-            print(f"Ep: {ep}, i: {i}/{len(dataloader)}, iteration: {iteration}, D(r): {mean(output_real):.3f}, D(f): {mean(output_fake):.3f}, D Loss: {(loss_real + loss_fake)/2:.3f}, G Loss:  {loss_generated:.3f}")
+            print(f"Ep: {ep}, i: {i}/{len(dataloader)}, iteration: {iteration}, D(r): {mean(output_real):.3f}, D(f): {mean(output_fake):.3f}, D Loss: {(loss_d)/2:.3f}, G Loss:  {loss_generated:.3f}")
         if iteration % sample_interval == 0:
             save_image(output, f"images/image-{ep}.png", normalize=True)
             save_image(output_128, f"images/image-128-{ep}.png", normalize=True)
